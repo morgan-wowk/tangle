@@ -140,21 +140,33 @@ class OrchestratorService_Sql:
         running_container_execution = session.scalar(query)
         if running_container_execution:
             self._running_executions_queue_idle = False
+            start_timestamp = time.monotonic_ns()
 
             # Set execution context for logging (includes container_execution_id)
             # Get first execution_node_id for context (there may be multiple nodes using same container)
-            execution_nodes = running_container_execution.execution_nodes
-            execution_node_id = execution_nodes[0].id if execution_nodes else None
+            execution_nodes = None
 
             with contextual_logging.logging_context(
-                execution_node_id=execution_node_id,
-                container_execution_id=running_container_execution.id,
+                container_execution_id=running_container_execution.id
             ):
-                _logger.info("Before processing running container execution")
                 try:
-                    self.internal_process_one_running_execution(
-                        session=session, container_execution=running_container_execution
-                    )
+                    execution_nodes = running_container_execution.execution_nodes
+
+                    if not execution_nodes:
+                        raise OrchestratorError(
+                            f"Container execution {running_container_execution.id} has no associated execution nodes"
+                        )
+
+                    execution_node_id = execution_nodes[0].id
+
+                    with contextual_logging.logging_context(
+                        execution_node_id=execution_node_id
+                    ):
+                        _logger.info("Before processing running container execution")
+                        self.internal_process_one_running_execution(
+                            session=session,
+                            container_execution=running_container_execution,
+                        )
                 except Exception as ex:
                     _logger.exception("Error processing running container execution")
                     session.rollback()
@@ -163,23 +175,33 @@ class OrchestratorService_Sql:
                     )
                     # Doing an intermediate commit here because it's most important to mark the problematic execution as SYSTEM_ERROR.
                     session.commit()
-                    # Mark our ExecutionNode as SYSTEM_ERROR
-                    for execution_node in execution_nodes:
-                        execution_node.container_execution_status = (
-                            bts.ContainerExecutionStatus.SYSTEM_ERROR
+
+                    # Mark our ExecutionNode as SYSTEM_ERROR (only if we successfully retrieved them)
+                    if execution_nodes is not None:
+                        for execution_node in execution_nodes:
+                            execution_node.container_execution_status = (
+                                bts.ContainerExecutionStatus.SYSTEM_ERROR
+                            )
+                            record_system_error_exception(
+                                execution=execution_node, exception=ex
+                            )
+                        # Doing an intermediate commit here because it's most important to mark the problematic node as SYSTEM_ERROR.
+                        session.commit()
+                        # Skip downstream executions
+                        for execution_node in execution_nodes:
+                            _mark_all_downstream_executions_as_skipped(
+                                session=session, execution=execution_node
+                            )
+                        session.commit()
+                    else:
+                        _logger.warning(
+                            "Could not mark execution nodes as SYSTEM_ERROR because execution_nodes could not be retrieved"
                         )
-                        record_system_error_exception(
-                            execution=execution_node, exception=ex
-                        )
-                    # Doing an intermediate commit here because it's most important to mark the problematic node as SYSTEM_ERROR.
-                    session.commit()
-                    # Skip downstream executions
-                    for execution_node in execution_nodes:
-                        _mark_all_downstream_executions_as_skipped(
-                            session=session, execution=execution_node
-                        )
-                    session.commit()
-                _logger.info("After processing running container execution")
+                finally:
+                    duration_ms = (time.monotonic_ns() - start_timestamp) / 1_000_000
+                    _logger.info(
+                        f"After processing running container execution (duration: {duration_ms}ms)"
+                    )
             return True
         else:
             if not self._running_executions_queue_idle:
